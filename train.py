@@ -1,5 +1,4 @@
 import os
-os.environ['HF_TOKEN'] = "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"
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
