@@ -2,6 +2,7 @@ from diffusers_helper.hf_login import login
 
 import os
 
+# 设置HF_HOME环境变量，指向当前目录下的hf_download文件夹
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 import gradio as gr
@@ -40,12 +41,15 @@ args = parser.parse_args()
 
 print(args)
 
+# 获取GPU的空闲内存
 free_mem_gb = get_cuda_free_memory_gb(gpu)
+# 判断是否为高VRAM模式
 high_vram = free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
+# 加载模型
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
@@ -63,25 +67,30 @@ text_encoder_2.eval()
 image_encoder.eval()
 transformer.eval()
 
+# 如果不是高VRAM模式，启用切片和分块
 if not high_vram:
     vae.enable_slicing()
     vae.enable_tiling()
 
+# 设置transformer的高质量FP32输出
 transformer.high_quality_fp32_output_for_inference = True
 print('transformer.high_quality_fp32_output_for_inference = True')
 
+# 将模型移动到指定设备
 transformer.to(dtype=torch.bfloat16)
 vae.to(dtype=torch.float16)
 image_encoder.to(dtype=torch.float16)
 text_encoder.to(dtype=torch.float16)
 text_encoder_2.to(dtype=torch.float16)
 
+# 禁用梯度计算
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
 text_encoder_2.requires_grad_(False)
 image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
 
+# 如果不是高VRAM模式，使用DynamicSwapInstaller进行模型交换
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
     DynamicSwapInstaller.install_model(transformer, device=gpu)
@@ -93,19 +102,24 @@ else:
     vae.to(gpu)
     transformer.to(gpu)
 
+# 创建异步流
 stream = AsyncStream()
 
+# 设置输出文件夹
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    # 计算总的latent section数
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
+    # 生成job_id
     job_id = generate_timestamp()
 
+    # 向输出队列中推送进度条
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
