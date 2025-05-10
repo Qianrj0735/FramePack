@@ -94,7 +94,7 @@ def train(
 
     # 2) 设备选择
     # device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    device = "cpu"
+    device = "cuda"
     # 3) 目录 & W&B 初始化
     run_name = datetime.now().strftime("%Y_%m_%d_%H%M%S")
     run_dir = os.path.join(log_root, run_name)
@@ -192,6 +192,7 @@ def train(
 
                 # 视频帧 → VAE 潜空间
                 vids = []
+                img_feats = []
                 seq_np = videos_np[0]
                 H, W = seq_np.shape[1], seq_np.shape[2]
                 H2, W2 = find_nearest_bucket(H, W, resolution=640)
@@ -201,6 +202,14 @@ def train(
                         [torch.from_numpy(f).permute(2, 0, 1) for f in resized], dim=1
                     )
                     vids.append(vid)
+                    # resizeds.append(resized)
+                    img_feat = hf_clip_vision_encode(
+                        resized[0], feature_extractor, image_encoder
+                    ).last_hidden_state.to(device)
+                    img_feats.append(img_feat)
+                llama_vec = llama_vec.repeat_interleave(len(vids), dim=0)
+                llama_mask = llama_mask.repeat_interleave(len(vids), dim=0)
+                img_feats = torch.cat(img_feats, dim=0)
                 vid = torch.stack(vids)
                 vid = (vid.to(device).float() / 127.5) - 1
                 video_latents = vae_encode(vid, vae)  # (B,C,T',h,w)
@@ -223,9 +232,6 @@ def train(
                 ).unsqueeze(0)
 
                 # CLIP 视觉特征
-                img_feats = hf_clip_vision_encode(
-                    resized[0], feature_extractor, image_encoder
-                ).last_hidden_state.to(device)
 
                 # DDPM 加噪
                 t = torch.randint(0, scheduler.num_train_timesteps, (B,), device=device)
@@ -236,20 +242,20 @@ def train(
                 gs = 10.0
                 distilled_guidance = torch.full((B,), gs * 1000.0, device=device)
                 out = transformer(
-                    hidden_states=noisy_latents,
+                    hidden_states=noisy_latents.to(torch.bfloat16),
                     timestep=t,
-                    encoder_hidden_states=llama_vec,
+                    encoder_hidden_states=llama_vec.to(torch.bfloat16),
                     encoder_attention_mask=llama_mask,
-                    pooled_projections=clip_pooler,
-                    guidance=distilled_guidance,
+                    pooled_projections=clip_pooler.to(torch.bfloat16),
+                    guidance=distilled_guidance.to(torch.bfloat16),
                     latent_indices=latent_idx,
-                    clean_latents=clean_latents,
+                    clean_latents=clean_latents.to(torch.bfloat16),
                     clean_latent_indices=clean_idx,
-                    clean_latents_2x=clean_latents_2x,
+                    clean_latents_2x=clean_latents_2x.to(torch.bfloat16),
                     clean_latent_2x_indices=idx_2x,
-                    clean_latents_4x=clean_latents_4x,
+                    clean_latents_4x=clean_latents_4x.to(torch.bfloat16),
                     clean_latent_4x_indices=idx_4x,
-                    image_embeddings=img_feats,
+                    image_embeddings=img_feats.to(torch.bfloat16),
                 )
                 pred_noise = out.sample
                 loss = F.mse_loss(pred_noise, noise)
@@ -338,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--hf_repo",
         type=str,
-        default="physical-intelligence/aloha_pen_uncap_diverse",
+        default="RUnia/IO_teleop_one_episode_piper_example",
         help="Hugging Face 数据集仓库名",
     )
     parser.add_argument("--epochs", type=int, default=10)
