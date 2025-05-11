@@ -1,4 +1,8 @@
 import os
+
+os.environ["HF_HOME"] = os.path.abspath(
+    os.path.realpath(os.path.join(os.path.dirname(__file__), "./hf_download"))
+)
 import random
 import torch
 import torch.nn.functional as F
@@ -41,7 +45,7 @@ class FramePackDataset(Dataset):
         self,
         hf_repo: str,
         split: str = "train",
-        seq_len: int = 19,
+        seq_len: int = 19 + 1 + 9,
         prompt: str = "a robotic arm performing a task",
     ):
         self.data = load_dataset(hf_repo, split=split)
@@ -66,14 +70,15 @@ class FramePackDataset(Dataset):
         for offset in range(idx - self.seq_len + 1, idx + 1):
             j = offset if offset >= ep_start else ep_start
             img: Image.Image = self.data[j]["observation.images.cam_high"]
+            img = img.resize((640, 608))
             frames.append(np.array(img))
         seq_np = np.stack(frames, axis=0)  # (T, H, W, 3)
-        return seq_np, self.prompt
+        return seq_np[:19], seq_np[19:20], seq_np[20:], self.prompt
 
 
 def collate_fn(batch):
-    videos, prompts = zip(*batch)
-    return np.array(videos), list(prompts)
+    his, start, future, prompts = zip(*batch)
+    return np.array(his), np.array(start), np.array(future), list(prompts)
 
 
 def train(
@@ -151,7 +156,7 @@ def train(
     scheduler = DDPMScheduler(beta_schedule="scaled_linear", num_train_timesteps=1000)
 
     # 6) 数据集 & DataLoader
-    dataset = FramePackDataset(hf_repo, split="train", seq_len=seq_len)
+    dataset = FramePackDataset(hf_repo, split="train", seq_len=19 + 1 + 9)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -174,7 +179,7 @@ def train(
     total_steps = 0
     for epoch in range(1, epochs + 1):
         with tqdm(loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
-            for step, (videos_np, prompts) in enumerate(pbar, start=1):
+            for step, (his, start, future, prompts) in enumerate(pbar, start=1):
                 total_steps += 1
 
                 # 文本条件编码
@@ -192,16 +197,32 @@ def train(
 
                 # 视频帧 → VAE 潜空间
                 vids = []
+                his_vids = []
+                future_vids = []
                 img_feats = []
-                seq_np = videos_np[0]
-                H, W = seq_np.shape[1], seq_np.shape[2]
+                s0 = start[0]
+                H, W = s0.shape[1], s0.shape[2]
                 H2, W2 = find_nearest_bucket(H, W, resolution=640)
-                for seq_np in videos_np:
-                    resized = [resize_and_center_crop(f, W2, H2) for f in seq_np]
+                for s, h, ft in zip(start, his, future):
+                    resized = [resize_and_center_crop(f, W2, H2) for f in s]
                     vid = torch.stack(
                         [torch.from_numpy(f).permute(2, 0, 1) for f in resized], dim=1
                     )
                     vids.append(vid)
+
+                    his_resized = [resize_and_center_crop(f, W2, H2) for f in h]
+                    his_vid = torch.stack(
+                        [torch.from_numpy(f).permute(2, 0, 1) for f in his_resized],
+                        dim=1,
+                    )
+                    his_vids.append(his_vid)
+
+                    future_resized = [resize_and_center_crop(f, W2, H2) for f in ft]
+                    future_vid = torch.stack(
+                        [torch.from_numpy(f).permute(2, 0, 1) for f in future_resized],
+                        dim=1,
+                    )
+                    future_vids.append(future_vid)
                     # resizeds.append(resized)
                     img_feat = hf_clip_vision_encode(
                         resized[0], feature_extractor, image_encoder
@@ -209,34 +230,83 @@ def train(
                     img_feats.append(img_feat)
                 llama_vec = llama_vec.repeat_interleave(len(vids), dim=0)
                 llama_mask = llama_mask.repeat_interleave(len(vids), dim=0)
+
                 img_feats = torch.cat(img_feats, dim=0)
+
                 vid = torch.stack(vids)
                 vid = (vid.to(device).float() / 127.5) - 1
-                video_latents = vae_encode(vid, vae)  # (B,C,T',h,w)
+                his_vid = torch.stack(his_vids)
+                his_vid = (his_vid.to(device).float() / 127.5) - 1
+                his_vid = his_vid.flip(2)
+                future_vid = torch.stack(future_vids)
+                future_vid = (future_vid.to(device).float() / 127.5) - 1
+                start_latent = vae_encode(vid, vae)
+                history_latents = torch.zeros_like(start_latent).repeat_interleave(
+                    his_vid.size(2), dim=2
+                )
+                future_latents = torch.zeros_like(start_latent).repeat_interleave(
+                    future_vid.size(2), dim=2
+                )
 
-                B, C, T, h, w = video_latents.shape
+                horizon = random.randint(0, 19)
+                for hrz in range(horizon):
+                    history_latents[:, :, hrz : hrz + 1, :, :] = vae_encode(
+                        his_vid[:, :, hrz : hrz + 1, :, :], vae
+                    )
+                for ft_hrz in range(9):
+                    future_latents[:, :, ft_hrz : ft_hrz + 1, :, :] = vae_encode(
+                        future_vid[:, :, ft_hrz : ft_hrz + 1, :, :], vae
+                    )
+                # history_latents = vae_encode(his_vid, vae)  # (B,C,T',h,w)
 
-                # multi-resolution clean_latents & indices
-                latent_idx = torch.arange(T, device=device).unsqueeze(0)
-                clean_latents = video_latents
-                clean_idx = latent_idx
-
-                clean_latents_2x = F.avg_pool3d(video_latents, (2, 4, 4), (2, 4, 4))
-                idx_2x = torch.arange(
-                    clean_latents_2x.shape[2], device=device
+                B, C, T, h, w = history_latents.shape
+                latent_window_size = 9
+                latent_padding = random.randint(0, 3)
+                latent_padding_size = latent_padding * latent_window_size
+                indices = torch.arange(
+                    0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])
                 ).unsqueeze(0)
+                (
+                    clean_latent_indices_pre,
+                    blank_indices,
+                    latent_indices,
+                    clean_latent_indices_post,
+                    clean_latent_2x_indices,
+                    clean_latent_4x_indices,
+                ) = indices.split(
+                    [1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1
+                )
+                clean_latent_indices = torch.cat(
+                    [clean_latent_indices_pre, clean_latent_indices_post], dim=1
+                )
 
-                clean_latents_4x = F.avg_pool3d(video_latents, (4, 8, 8), (4, 8, 8))
-                idx_4x = torch.arange(
-                    clean_latents_4x.shape[2], device=device
-                ).unsqueeze(0)
+                clean_latents_pre = start_latent.to(history_latents)
+                clean_latents_post, clean_latents_2x, clean_latents_4x = (
+                    history_latents[:, :, : 1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+                )
+                clean_latents = torch.cat(
+                    [clean_latents_pre, clean_latents_post], dim=2
+                )
 
                 # CLIP 视觉特征
 
                 # DDPM 加噪
+                rnd = torch.Generator("cuda").manual_seed(3407)
+                num_frames = latent_window_size * 4 - 3
                 t = torch.randint(0, scheduler.num_train_timesteps, (B,), device=device)
-                noise = torch.randn_like(video_latents)
-                noisy_latents = scheduler.add_noise(video_latents, noise, t)
+                noise = torch.randn(
+                    (
+                        B,
+                        16,
+                        (num_frames + 3) // 4,
+                        H2 // 8,
+                        W2 // 8,
+                    ),
+                    generator=rnd,
+                    device=rnd.device,
+                ).to(device=device, dtype=torch.float32)
+
+                noisy_latents = scheduler.add_noise(future_latents, noise, t)
 
                 # 前向 + 损失
                 gs = 10.0
@@ -248,13 +318,13 @@ def train(
                     encoder_attention_mask=llama_mask,
                     pooled_projections=clip_pooler.to(torch.bfloat16),
                     guidance=distilled_guidance.to(torch.bfloat16),
-                    latent_indices=latent_idx,
+                    latent_indices=latent_indices,
                     clean_latents=clean_latents.to(torch.bfloat16),
-                    clean_latent_indices=clean_idx,
+                    clean_latent_indices=clean_latent_indices,
                     clean_latents_2x=clean_latents_2x.to(torch.bfloat16),
-                    clean_latent_2x_indices=idx_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
                     clean_latents_4x=clean_latents_4x.to(torch.bfloat16),
-                    clean_latent_4x_indices=idx_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
                     image_embeddings=img_feats.to(torch.bfloat16),
                 )
                 pred_noise = out.sample
